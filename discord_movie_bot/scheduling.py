@@ -65,21 +65,18 @@ def parse_availability_string(avail_str: str) -> List[DayTimeRange]:
     return ranges
 
 def compute_common_overlaps(ticket_holders: Dict[int, TicketHolder]) -> List[ScheduleSlot]:
-    """Return windows where all users who provided availability are available."""
     participants = [uid for uid, th in ticket_holders.items() if th.availability]
     if not participants:
         return []
-    # group by day
-    day_map: Dict[str, List[Tuple[int, DayTimeRange]]] = {}
+    day_map: Dict[str, List[tuple[int, DayTimeRange]]] = {}
     for uid, th in ticket_holders.items():
         for r in th.availability:
             day_map.setdefault(r.day, []).append((uid, r))
     result: List[ScheduleSlot] = []
     for day, entries in day_map.items():
-        # ensure every participant has an entry that day
         if set(u for u,_ in entries) != set(participants):
             continue
-        events: List[Tuple[int,int]] = []
+        events: List[tuple[int,int]] = []
         for _, r in entries:
             events.append((_time_to_minutes(r.start_time), +1))
             events.append((_time_to_minutes(r.end_time), -1))
@@ -97,16 +94,13 @@ def compute_common_overlaps(ticket_holders: Dict[int, TicketHolder]) -> List[Sch
     return result
 
 def compute_popular_slots(ticket_holders: Dict[int, TicketHolder]) -> List[ScheduleSlot]:
-    """Return windows with highest availability counts (merged)."""
-    # Build per-day event sweeps
     day_to_user_ranges: Dict[str, Dict[int, List[DayTimeRange]]] = {}
     for uid, th in ticket_holders.items():
         for r in th.availability:
             day_to_user_ranges.setdefault(r.day, {}).setdefault(uid, []).append(r)
-
     slots: List[ScheduleSlot] = []
     for day, user_ranges in day_to_user_ranges.items():
-        events: List[Tuple[int,str,int]] = []
+        events: List[tuple[int,str,int]] = []
         for uid, ranges in user_ranges.items():
             for r in ranges:
                 events.append((_time_to_minutes(r.start_time), "start", uid))
@@ -120,8 +114,7 @@ def compute_popular_slots(ticket_holders: Dict[int, TicketHolder]) -> List[Sched
             if typ == "start": active.add(uid)
             else: active.discard(uid)
             prev = t
-
-    # Merge adjacent with identical participants
+    # merge adjacent identical windows
     slots.sort(key=lambda s: (DAY_INDEX.get(s.day, 7), s.start_time))
     merged: List[ScheduleSlot] = []
     for s in slots:
@@ -129,23 +122,20 @@ def compute_popular_slots(ticket_holders: Dict[int, TicketHolder]) -> List[Sched
             merged[-1].end_time = s.end_time
         else:
             merged.append(s)
-
-    # Sort by popularity (participants desc, then duration desc)
+    # popularity sort
     def duration(s: ScheduleSlot) -> int:
         return _time_to_minutes(s.end_time) - _time_to_minutes(s.start_time)
     merged.sort(key=lambda s: (len(s.participants), duration(s)), reverse=True)
     return merged
 
 def next_date_for_weekday(tz: ZoneInfo, weekday_name: str) -> dt.date:
-    """Return the next calendar date for the given weekday in timezone tz."""
     now = dt.datetime.now(tz).date()
     target = DAY_INDEX[weekday_name]
     today_idx = dt.datetime.now(tz).weekday()
     days_ahead = (target - today_idx) % 7 or 7
     return now + dt.timedelta(days=days_ahead)
 
-def slot_to_iso_start_end(tz: ZoneInfo, slot: ScheduleSlot, runtime_minutes: int) -> Tuple[str, str]:
-    """Given a slot (day + HH:MM) and a runtime, return ISO-8601 start/end strings."""
+def slot_to_iso_start_end(tz: ZoneInfo, slot: ScheduleSlot, runtime_minutes: int) -> tuple[str, str]:
     date = next_date_for_weekday(tz, slot.day)
     h, m = [int(x) for x in slot.start_time.split(":")]
     start_dt = dt.datetime(date.year, date.month, date.day, h, m, tzinfo=tz)
