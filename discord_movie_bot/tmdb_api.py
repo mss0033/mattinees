@@ -1,147 +1,215 @@
-"""TMDb API wrapper (HTTPS, shared aiohttp session, v3 API key).
-
-Endpoints used:
-- /search/movie
-- /movie/{id}
-- /movie/{id}/videos
-- /movie/{id}/release_dates
-
-We extract:
-- details: title, release_date (year), runtime, overview, poster_path,
-  genres, original_language, popularity
-- videos: first YouTube Trailer
-- release_dates: certification and optional descriptors (content reasons)
-"""
-
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple
+
 import asyncio
+from typing import Any, Dict, List, Optional, Tuple
+
 import aiohttp
 
 from .config import TMDB_API_KEY
-from .models import Movie, MovieContentAdvisory
+from .models import Movie, MovieAdvisory
 
-_API_BASE = "https://api.themoviedb.org/3"
-_IMAGE_BASE = "https://image.tmdb.org/t/p"
+TMDB_API_BASE = "https://api.themoviedb.org/3"
+TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 
-_session: aiohttp.ClientSession | None = None
+# We use the v3 API key via the "api_key" query param (NOT the read access token).
+# Session is created lazily and closed via close_session().
+_session: Optional[aiohttp.ClientSession] = None
 _session_lock = asyncio.Lock()
 
-async def _get_session() -> aiohttp.ClientSession:
+
+async def _ensure_session() -> aiohttp.ClientSession:
     global _session
     async with _session_lock:
-        if _session and not _session.closed:
-            return _session
-        timeout = aiohttp.ClientTimeout(total=10)
-        _session = aiohttp.ClientSession(timeout=timeout)
+        if _session is None or _session.closed:
+            _session = aiohttp.ClientSession()
         return _session
+
 
 async def close_session() -> None:
     global _session
-    async with _session_lock:
-        if _session and not _session.closed:
-            await _session.close()
-        _session = None
+    if _session and not _session.closed:
+        await _session.close()
+    _session = None
 
-def _require_key():
+
+async def _tmdb_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not TMDB_API_KEY:
-        raise RuntimeError("TMDB_API_KEY is not configured.")
-
-async def _get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    _require_key()
-    params = params or {}
-    params["api_key"] = TMDB_API_KEY  # v3 API key in query
-    url = f"{_API_BASE}{path}"
-    s = await _get_session()
-    async with s.get(url, params=params, ssl=True) as resp:
-        resp.raise_for_status()
+        raise RuntimeError("TMDB_API_KEY is not set in the environment/.env")
+    sess = await _ensure_session()
+    p = dict(params or {})
+    p["api_key"] = TMDB_API_KEY
+    url = f"{TMDB_API_BASE}{path}"
+    async with sess.get(url, params=p, timeout=20) as resp:
+        if resp.status != 200:
+            text = await resp.text()
+            raise RuntimeError(f"TMDb GET {path} failed: {resp.status} {text}")
         return await resp.json()
 
-def _poster_url(poster_path: Optional[str], size: str = "w500") -> str:
-    if not poster_path or poster_path == "N/A":
-        return ""
-    return f"{_IMAGE_BASE}/{size}{poster_path}"
 
-async def search_movie(title: str) -> List[Dict[str, Any]]:
-    data = await _get("/search/movie", {"query": title, "include_adult": "false"})
-    return data.get("results", [])
+def _pick_certification_and_descriptors(release_dates: Dict[str, Any]) -> Optional[MovieAdvisory]:
+    """
+    Parse /movie/{id}/release_dates to select the best certification + descriptors.
+    Preference order by region: US, GB, CA, AU, else first available.
+    Within a region, prefer type=3 (Theatrical), then 2,1,4,5,6.
+    """
+    if not release_dates or "results" not in release_dates:
+        return None
 
-async def get_movie_details(tmdb_id: int) -> Dict[str, Any]:
-    return await _get(f"/movie/{tmdb_id}")
+    region_priority = ["US", "GB", "CA", "AU"]
+    type_order = {3: 0, 2: 1, 1: 2, 4: 3, 5: 4, 6: 5}  # lower is better
 
-async def get_movie_videos(tmdb_id: int) -> List[Dict[str, Any]]:
-    data = await _get(f"/movie/{tmdb_id}/videos")
-    return data.get("results", [])
-
-async def get_movie_release_dates(tmdb_id: int) -> List[Dict[str, Any]]:
-    data = await _get(f"/movie/{tmdb_id}/release_dates")
-    return data.get("results", [])
-
-def _pick_trailer(videos: List[Dict[str, Any]]) -> Optional[str]:
-    for v in videos:
-        if v.get("site") == "YouTube" and v.get("type") == "Trailer":
-            key = v.get("key")
-            if key:
-                return f"https://www.youtube.com/watch?v={key}"
-    return None
-
-def _extract_advisory(release_dates: List[Dict[str, Any]], preferred_regions: Tuple[str, ...] = ("US","GB","CA")) -> Optional[MovieContentAdvisory]:
-    for region in preferred_regions:
-        for entry in release_dates:
-            if entry.get("iso_3166_1") != region:
+    def best_for_region(entries: List[Dict[str, Any]]) -> Optional[Tuple[str, List[str]]]:
+        # entries is list of release_dates dicts with fields: certification, type, descriptors
+        # we want the one with non-empty certification; break ties by type_order
+        candidates = []
+        for e in entries:
+            cert = (e.get("certification") or "").strip()
+            if not cert:
                 continue
-            for rd in entry.get("release_dates", []):
-                cert = (rd.get("certification") or "").strip()
-                if cert:
-                    desc = rd.get("descriptors") or []
-                    norm = [str(x).strip().title() for x in desc if str(x).strip()]
-                    return MovieContentAdvisory(region=region, certification=cert, descriptors=norm)
-    for entry in release_dates:
-        for rd in entry.get("release_dates", []):
-            cert = (rd.get("certification") or "").strip()
-            if cert:
-                return MovieContentAdvisory(region=entry.get("iso_3166_1",""), certification=cert, descriptors=rd.get("descriptors") or [])
+            t = int(e.get("type") or 0)
+            descriptors = e.get("descriptors") or []
+            candidates.append((type_order.get(t, 99), cert, descriptors))
+        if not candidates:
+            # If descriptors exist even without certification, we can still return them (rare)
+            for e in entries:
+                desc = e.get("descriptors") or []
+                if desc:
+                    return ("NR", list(desc))
+            return None
+        candidates.sort(key=lambda x: x[0])
+        _, cert, desc = candidates[0]
+        return (cert, list(desc or []))
+
+    best_region = None
+    best_value: Optional[Tuple[str, List[str]]] = None
+
+    # Scan preferred regions first
+    for r in region_priority:
+        region_entry = next((x for x in release_dates["results"] if x.get("iso_3166_1") == r), None)
+        if not region_entry:
+            continue
+        val = best_for_region(region_entry.get("release_dates") or [])
+        if val:
+            best_region = r
+            best_value = val
+            break
+
+    # Fallback: first region with a viable certification
+    if not best_value:
+        for region_entry in release_dates["results"]:
+            r = region_entry.get("iso_3166_1") or "XX"
+            val = best_for_region(region_entry.get("release_dates") or [])
+            if val:
+                best_region = r
+                best_value = val
+                break
+
+    if not best_value:
+        return None
+
+    cert, descriptors = best_value
+    return MovieAdvisory(certification=cert, region=best_region or "XX", descriptors=descriptors)
+
+
+def _extract_trailer(videos: Dict[str, Any]) -> Optional[str]:
+    """
+    From /movie/{id}?append_to_response=videos, pick the best YouTube trailer.
+    Prefer official trailers; fallback to first YouTube trailer.
+    """
+    try:
+        results = videos.get("results") if isinstance(videos, dict) else None
+        if not results:
+            return None
+        # official YouTube trailer
+        for v in results:
+            if v.get("site") == "YouTube" and v.get("type") == "Trailer" and v.get("official") is True:
+                key = v.get("key")
+                if key:
+                    return f"https://www.youtube.com/watch?v={key}"
+        # any YouTube trailer
+        for v in results:
+            if v.get("site") == "YouTube" and v.get("type") == "Trailer":
+                key = v.get("key")
+                if key:
+                    return f"https://www.youtube.com/watch?v={key}"
+    except Exception:
+        return None
     return None
 
-async def build_movie_from_tmdb_id(tmdb_id: int) -> Optional[Movie]:
-    details = await get_movie_details(tmdb_id)
+
+def _poster_url_from_path(poster_path: Optional[str]) -> Optional[str]:
+    if not poster_path:
+        return None
+    return f"{TMDB_IMAGE_BASE}{poster_path}"
+
+
+def _year_from_date(date_str: Optional[str]) -> str:
+    if not date_str:
+        return ""
+    try:
+        return date_str[:4]
+    except Exception:
+        return ""
+
+
+async def _build_movie_from_details(details: Dict[str, Any]) -> Optional[Movie]:
     if not details:
         return None
-    title = details.get("title") or details.get("original_title") or "Unknown"
-    year = (details.get("release_date") or "")[:4]
+
+    tmdb_id = details.get("id")
+    if tmdb_id is None:
+        return None
+
+    title = details.get("title") or details.get("name") or ""
+    year = _year_from_date(details.get("release_date") or details.get("first_air_date"))
     runtime = int(details.get("runtime") or 0)
     overview = details.get("overview") or ""
-    poster_url = _poster_url(details.get("poster_path"))
-    genres = [g.get("name","") for g in details.get("genres", []) if g.get("name")]
-    original_language = details.get("original_language") or "en"
-    popularity = float(details.get("popularity") or 0.0)
+    genres = [g.get("name") for g in (details.get("genres") or []) if g.get("name")]
+    poster_url = _poster_url_from_path(details.get("poster_path"))
+    trailer_url = _extract_trailer(details.get("videos") or {})
 
-    videos = await get_movie_videos(tmdb_id)
-    trailer_url = _pick_trailer(videos)
-    rel = await get_movie_release_dates(tmdb_id)
-    advisory = _extract_advisory(rel)
+    advisory = _pick_certification_and_descriptors(details.get("release_dates") or {})
+
     return Movie(
-        tmdb_id=tmdb_id,
+        tmdb_id=int(tmdb_id),
         title=title,
-        year=year,
+        year=str(year),
         runtime=runtime,
         overview=overview,
+        genres=genres,
         poster_url=poster_url,
         trailer_url=trailer_url,
         advisory=advisory,
-        genres=genres,
-        original_language=original_language,
-        popularity=popularity,
     )
 
-async def build_movie_from_title(title_or_id: str) -> Optional[Movie]:
-    # Numeric TMDb ID passthrough
-    try:
-        tmdb_id = int(title_or_id)
-        return await build_movie_from_tmdb_id(tmdb_id)
-    except ValueError:
-        pass
-    results = await search_movie(title_or_id)
+
+async def build_movie_from_tmdb_id(tmdb_id: int) -> Optional[Movie]:
+    """
+    Fetch a movie by TMDb ID, including videos and release dates:
+      GET /movie/{id}?append_to_response=videos,release_dates
+    """
+    params = {"append_to_response": "videos,release_dates", "language": "en-US"}
+    details = await _tmdb_get(f"/movie/{tmdb_id}", params)
+    return await _build_movie_from_details(details)
+
+
+async def build_movie_from_title(title: str) -> Optional[Movie]:
+    """
+    Search for a title and then fetch details for the top hit.
+      GET /search/movie?query=...
+      GET /movie/{id}?append_to_response=videos,release_dates
+    """
+    q = (title or "").strip()
+    if not q:
+        return None
+    search = await _tmdb_get("/search/movie", {"query": q, "include_adult": "false", "language": "en-US"})
+    results = search.get("results") or []
     if not results:
         return None
-    return await build_movie_from_tmdb_id(int(results[0]["id"]))
+    # pick the best result (highest popularity, then most recent year)
+    results.sort(key=lambda r: (float(r.get("popularity") or 0.0), _year_from_date(r.get("release_date"))), reverse=True)
+    top = results[0]
+    mid = top.get("id")
+    if not mid:
+        return None
+    return await build_movie_from_tmdb_id(int(mid))

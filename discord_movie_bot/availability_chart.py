@@ -1,91 +1,115 @@
-"""Generate swimlane availability charts (portable temp path, per-day or all)."""
-
 from __future__ import annotations
-import tempfile
+
+import os
+import time
 from typing import Dict, List, Optional
 
+# Use a non-interactive backend for headless servers
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # noqa: E402
 
-from .models import TicketHolder
-from .scheduling import WEEKDAY_ORDER, compute_common_overlaps, _time_to_minutes
+from .models import TicketHolder, DayTimeRange
+from .scheduling import WEEKDAY_ORDER
 
 
-def create_availability_chart(ticket_holders: Dict[int, TicketHolder],
-                              output_path: Optional[str] = None,
-                              day: Optional[str] = None) -> str:
-    """Render a chart (optionally for a single day). Returns path to PNG."""
-    path = output_path or (tempfile.gettempdir() + "/availability_chart.png")
+def _hhmm_to_hours(s: str) -> float:
+    """Convert 'HH:MM' to hours as a float (e.g., '18:30' -> 18.5)."""
+    hh, mm = s.split(":")
+    return int(hh) + int(mm) / 60.0
 
-    # Gather days
-    all_days = set()
-    for th in ticket_holders.values():
-        for r in th.availability:
-            all_days.add(r.day)
-    days = [d for d in WEEKDAY_ORDER if d in all_days]
-    if day:
-        days = [d for d in days if d == day]
 
-    if not days:
-        fig, ax = plt.subplots(figsize=(8,2))
-        ax.text(0.5,0.5,"No availability data submitted.", ha="center", va="center", fontsize=14)
-        ax.axis("off")
-        fig.savefig(path)
-        plt.close(fig)
-        return path
+def _collect_blocks_for_day(th: TicketHolder, day: str) -> List[DayTimeRange]:
+    return [r for r in th.availability if r.day == day]
 
-    num_users = len(ticket_holders)
-    row_labels: List[str] = []
-    row_map: List[tuple[str, int]] = []
-    for d in days:
-        for uid, th in ticket_holders.items():
-            row_labels.append(f"{d} – {th.user_name}")
-            row_map.append((d, uid))
-        row_labels.append(f"{d} – Common Overlap")
-        row_map.append((d, -1))
 
-    fig_height = max(2, len(row_labels) * 0.4)
-    fig, ax = plt.subplots(figsize=(12, fig_height))
+def create_availability_chart(
+    ticket_holders: Dict[int, TicketHolder],
+    day: Optional[str] = None,
+) -> str:
+    """
+    Render a swimlanes-style availability chart and return the PNG file path.
+    - If `day` is provided, show that single day with one lane per user.
+    - Otherwise, show all 7 days, grouped top-to-bottom; for each day, one lane per user.
+    """
+    # Determine which days to plot
+    days_to_plot = [day] if day in WEEKDAY_ORDER else WEEKDAY_ORDER
 
-    # draw user ranges
-    color_user = "#6baed6"
-    color_overlap = "#fd8d3c"
-    for idx, (d, uid) in enumerate(row_map):
-        if uid == -1:
-            continue
-        th = ticket_holders[uid]
-        for r in th.availability:
-            if r.day != d: continue
-            start = _time_to_minutes(r.start_time)
-            end = _time_to_minutes(r.end_time)
-            ax.barh(idx, end - start, left=start, height=0.8, color=color_user)
+    # Build a stable, readable user order
+    users: List[TicketHolder] = sorted(
+        ticket_holders.values(),
+        key=lambda th: (th.user_name or str(th.user_id)).lower()
+    )
+    user_labels = [(u.user_name or str(u.user_id)) for u in users]
+    num_users = max(1, len(users))  # avoid div-by-zero
 
-    # draw full overlaps on special rows
-    overlaps = compute_common_overlaps(ticket_holders)
-    # index of overlap row for each day
-    day_to_overlap_idx = {}
-    idx = 0
-    for d in days:
-        idx += num_users  # skip user rows
-        day_to_overlap_idx[d] = idx
-        idx += 1
-    for s in overlaps:
-        if s.day not in day_to_overlap_idx: continue
-        start = _time_to_minutes(s.start_time)
-        end = _time_to_minutes(s.end_time)
-        ax.barh(day_to_overlap_idx[s.day], end - start, left=start, height=0.8, color=color_overlap)
+    # Lane indexing: for each (day, user) pair assign a y position
+    # layout: day 0 group occupies rows [0..num_users-1], day 1 group occupies [num_users+1 .. 2*num_users], etc.
+    lane_y_positions: Dict[tuple, float] = {}
+    group_gap = 1  # one row gap between day groups
+    total_rows = 0
+    for di, d in enumerate(days_to_plot):
+        base = di * (num_users + group_gap)
+        for ui, _user in enumerate(users):
+            lane_y_positions[(d, _user.user_id)] = base + ui
+        total_rows = base + num_users  # track maximum used row index
 
-    # axes
-    ax.set_yticks(range(len(row_labels)))
-    ax.set_yticklabels(row_labels, fontsize=8)
-    ax.set_ylim(-0.5, len(row_labels)-0.5)
-    ax.set_xlim(0, 24*60)
-    ax.set_xticks([i*60*2 for i in range(13)])
-    ax.set_xticklabels([f"{i*2:02d}:00" for i in range(13)], rotation=45)
-    ax.set_xlabel("Time of day (HH:MM)")
-    ax.set_title("User Availability")
-    plt.tight_layout()
-    fig.savefig(path)
+    # Figure sizing heuristic: width fixed; height scales with lanes
+    lanes_count = len(days_to_plot) * num_users + (len(days_to_plot) - 1) * group_gap
+    fig_w = 16
+    fig_h = max(3, min(20, 0.6 * lanes_count + 1))  # cap height to keep files reasonable
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    # Axes: time 0..24 on X; categorical lanes on Y
+    ax.set_xlim(0, 24)
+    ax.set_xlabel("Time (24h)")
+    # set up y-ticks and labels
+    yticks: List[float] = []
+    ylabels: List[str] = []
+    for di, d in enumerate(days_to_plot):
+        base = di * (num_users + group_gap)
+        for ui, u in enumerate(users):
+            y = base + ui
+            yticks.append(y)
+            label = f"{d} — {user_labels[ui]}"
+            ylabels.append(label)
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(ylabels)
+
+    # Gridlines: vertical hour lines, subtle horizontal separators at day group gaps
+    ax.set_xticks(list(range(0, 25, 1)))
+    ax.grid(axis="x", linestyle=":", linewidth=0.8)
+    # horizontal lines between day groups
+    for di in range(1, len(days_to_plot)):
+        y = di * (num_users + group_gap) - 0.5
+        ax.axhline(y=y, linestyle="--", linewidth=0.8, alpha=0.5)
+
+    # Draw each availability block as a horizontal bar on the user's lane
+    bar_height = 0.8
+    for u in users:
+        for d in days_to_plot:
+            lane_y = lane_y_positions[(d, u.user_id)]
+            blocks = _collect_blocks_for_day(u, d)
+            for r in blocks:
+                xs = _hhmm_to_hours(r.start_time)
+                xe = _hhmm_to_hours(r.end_time)
+                if xe <= xs:
+                    continue
+                ax.broken_barh([(xs, xe - xs)], (lane_y - bar_height / 2, bar_height))
+
+    # Title
+    title = "Availability"
+    if day in WEEKDAY_ORDER:
+        title += f" — {day}"
+    ax.set_title(title)
+
+    fig.tight_layout()
+
+    # Save to a temp file and return the path
+    ts = int(time.time() * 1000)
+    out_path = os.path.join(os.getcwd(), "data", f"availability_{ts}.png")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    return path
+
+    return out_path

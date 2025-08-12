@@ -2,323 +2,277 @@
 
 A Discord slash-command bot to run cozy, well-organized movie nights:
 
-- Manage a **catalog** of available movies (with posters, trailers, runtime, genres, certification, and granular content warnings from TMDb).
-- Let members **browse/search** the catalog, get info, and **nominate** titles for a vote.
-- Keep the ballot to **≤ 3 options** at all times for quick consensus.
-- Collect **availability** via a friendly, multi-step **wizard** or text DSL; render a visual **availability chart**.
-- Suggest and vote on **time slots** (also limited to ≤ 3).
-- Handle **seats** (3 guests + host) with waitlist.
-- **Autosave** JSON state, **backups** with rotation, **restore/undo**, and robust error handling.
+• Manage a **catalog** of available movies (TMDb: posters, trailers, runtime, genres, certification, descriptors).  
+• Let members **browse/search** the catalog, get info, and **nominate** titles for a vote.  
+• Keep the ballot to **≤ 3 options** at all times for quick consensus.  
+• Collect **availability** via a friendly, multi-step **wizard** or text DSL; render a visual **availability chart**.  
+• Suggest and vote on **time slots** (also limited to ≤ 3).  
+• Handle **seats** (3 guests + host) with waitlist.  
+• **Autosave** JSON state, **backups** with rotation, **restore/undo**, and robust error handling.
 
-The bot is intentionally modular, safe, and easy to maintain.
+This project is intentionally modular, safe, and easy to maintain.
 
----
+----------------------------------------------------------------
 
 ## Quick Start
 
-1) **Create a Discord application & bot**
-- Visit the Discord Developer Portal and create an application.
-- Add a **Bot** to the application.
-- Copy the **Bot Token** (you’ll put it in `.env` as `DISCORD_TOKEN`).
-- Invite the bot to your server with scopes: `bot` and `applications.commands`. Minimal permissions needed: `Send Messages`, `Embed Links`, `Attach Files`, `Use Slash Commands`.
+1) Create a Discord application & bot
+  - In the Discord Developer Portal, create an application → add a **Bot**.
+  - Copy the **Bot Token** (you’ll put it in .env as DISCORD_TOKEN).
+  - Invite the bot to your server with scopes: bot and applications.commands.
+  - Minimal permissions: Send Messages, Embed Links, Attach Files, Use Slash Commands.
 
-2) **Get a TMDb API Key (v3)**
-- Create an account at The Movie Database (TMDb), request an **API Key (v3)**.
-- Use the **API Key** (NOT the “API Read Access Token”) in `.env` as `TMDB_API_KEY`.
+2) Get a TMDb API Key (v3)
+  - Create a TMDb account and request an **API Key (v3)**.
+  - Use the API Key (v3) in .env as TMDB_API_KEY.
+  - Do not use the “API Read Access Token” for this bot.
 
-3) **Prepare the project**
-- Python 3.11–3.13 works (we tested on 3.13).
-- Create a virtual environment and install requirements.
-- Put a `.env` file in the project root.
-- Run the bot module.
+3) Prepare the project
+  - Python 3.11–3.13 supported (this repo tested on 3.13).
+  - Create a venv and install requirements.
+  - Put a .env file in the project root.
 
-Example shell session (Linux/macOS):
-
-    python3 -m venv venv
-    source venv/bin/activate
-    pip install -r requirements.txt
-
-4) **Create `.env` in the project root**
-
-    DISCORD_TOKEN=your_bot_token_here
-    TMDB_API_KEY=your_tmdb_v3_api_key_here
-    TIMEZONE=America/New_York
-    DEV_GUILD_ID=123456789012345678
-    MAX_SEATS=3
-
-Notes:
-- `DEV_GUILD_ID` is your development server’s **Guild (Server) ID**. It speeds up slash-command propagation during development. You can omit it for global sync (takes longer).
-- `TIMEZONE` is used to compute ISO-8601 start/end times when scheduling.
-- `MAX_SEATS` is the number of guest seats (host is implicit).
-
-5) **Run it**
-
-From the repo root:
-
-    python3 -m discord_movie_bot.bot
+4) Run it from the repository root
+  - python3 -m discord_movie_bot.bot
 
 You should see logs like:
-- “Logged in as …”
-- “Slash commands synced to guild …” (if `DEV_GUILD_ID` set), otherwise “globally synced”.
+  - “Logged in as …”
+  - “Slash commands synced to guild …” (instant if DEV_GUILD_ID is set) or “globally synced” (can take a few minutes).
 
----
+----------------------------------------------------------------
+
+## Configuration (.env in project root)
+
+DISCORD_TOKEN=your_bot_token_here  
+TMDB_API_KEY=your_tmdb_v3_api_key_here  
+TIMEZONE=America/New_York  
+DEV_GUILD_ID=123456789012345678  
+MAX_SEATS=3
+
+Notes:
+• DEV_GUILD_ID is your development server’s Guild (Server) ID. Enable Discord “Developer Mode”, right-click your server name, Copy Server ID. Guild sync is instant; global sync takes longer.  
+• TIMEZONE is used when computing ISO-8601 start/end times (e.g., when finalizing a schedule).  
+• MAX_SEATS is the number of guest seats (host is implicit and not counted).
+
+----------------------------------------------------------------
 
 ## Directory Layout
 
-This repo is a Python package. Run the bot with `-m` from the project root.
+<repo-root>/  
+  .env  
+  requirements.txt  
+  discord_movie_bot/  
+    __init__.py  
+    bot.py  
+    config.py  
+    models.py  
+    scheduling.py  
+    storage.py  
+    availability_chart.py  
+    tmdb_api.py  
+  data/  
+    state.json            (created on first run)  
+    backups/              (timestamped JSON backups)
 
-    <repo-root>/
-      .env
-      requirements.txt
-      discord_movie_bot/
-        __init__.py
-        bot.py
-        config.py
-        models.py
-        scheduling.py
-        storage.py
-        availability_chart.py
-        tmdb_api.py
-      data/
-        state.json             (created on first run)
-        backups/               (timestamped JSON backups)
+Run the bot from the repo root using the module form:
+  python3 -m discord_movie_bot.bot
 
-If you see “ImportError: attempted relative import with no known parent package”, make sure you’re running from the repo root:
+If you see “attempted relative import with no known parent package”, you’re not running from the project root.
 
-    python3 -m discord_movie_bot.bot
+----------------------------------------------------------------
 
----
+## Data Persistence & Safety
 
-## Configuration
+• All state is in memory and autosaved to data/state.json every 30s.  
+• Manual backups go to data/backups/ with rotation (latest N retained).  
+• Undo/Restore replaces in-memory state and **restarts autosave** so it writes the restored object (fixes the classic “autosave kept writing the old object” bug).  
+• JSON read/writes are confined to the data/ directory.
 
-These are read from `.env` in the **repo root**:
+Backward compatibility:
+• Catalog is safe: we do not re-fetch or mutate movies on load. Unknown/legacy fields are ignored.  
+• Time-slot votes migrated from fragile indices to stable keys; if an older state used indexes, user time votes are cleared once on load (movie votes are unaffected).  
+• Existing time options get a stable key automatically.  
+• Active ballot message references are optional and default to None (populated the next time you open a ballot).
 
-- `DISCORD_TOKEN`: Bot token from the Discord Developer Portal.
-- `TMDB_API_KEY`: TMDb **API Key (v3)** — we do **not** use the Read Access Token.
-- `TIMEZONE`: IANA timezone (e.g., `America/New_York`) for ISO-8601 schedule outputs.
-- `DEV_GUILD_ID`: (Optional) Guild ID to sync commands quickly during development.
-- `MAX_SEATS`: Number of guest seats (default 3). Host is not counted.
-
-### How to get your Dev Guild ID
-
-1. In Discord: **Settings → Advanced → Developer Mode → On**.  
-2. Right-click your server name → **Copy Server ID**.  
-3. Put it in `.env` as `DEV_GUILD_ID=...`.
-
----
-
-## Data Persistence
-
-- The in-memory state is serialized to `data/state.json`.
-- There’s a background **autosave** loop (interval is defined in `storage.py`).
-- Manual **backups** go into `data/backups/` with timestamped filenames and rotation.
-- **Restore/Undo** replaces the in-memory state and **restarts autosave** so it writes the restored object (we fixed this explicitly).
-
-You can also export/import catalog data with commands.
-
----
+----------------------------------------------------------------
 
 ## Commands (Slash)
 
-Below is a concise overview. Most commands reply **ephemerally** unless collaboration makes public replies better (like opening a vote).
+Most personal flows reply ephemerally; collaborative posts (like ballots) are public.
 
-### Catalog (`/catalog …`)
+Catalog (/catalog …)
+• list — Browse the catalog with optional filters (genre, year, max runtime, certification). Opens an ephemeral “Catalog Browser” with paging and a quick info panel.  
+• search — Search by title/genre text; opens the Catalog Browser with results.  
+• add — Admin. Add titles or TMDb IDs (comma-separated).  
+• remove — Admin. Remove movies by TMDb IDs (comma-separated).  
+• clear — Admin. Clear all catalog entries (confirmation modal).  
+• info — Fetch info for a title or TMDb ID (runtime, synopsis, genres, certification, trailer, poster).
 
-- `add` — Admin. Add titles or TMDb IDs (comma-separated).
-- `remove` — Admin. Remove movies by TMDb IDs (comma-separated).
-- `clear` — Admin. Clear entire catalog (confirmation modal).
-- `refresh` — Admin. Re-fetch TMDb metadata for given ID(s).
-- `export` — Admin. Export catalog as text.
-- `import_file` — Admin. Import from an uploaded text file (one title or TMDb ID per line).
-- `list` — Browse catalog with optional filters.
-- `search` — Search by title/genre fragments.
-- `info` — Get info for a title or TMDb ID.
+Movies (/movies …)
+• my_nominations — Ephemeral panel showing your nominations with a retract button.  
+• nominees_panel — Admin. Public summary with a “Nominate from Catalog” button and “View My Nominations.”  
+• nominate — Power users. Nominate by TMDb ID (the browser is preferred for most users).  
+• retract_nomination — Power users. Retract by TMDb ID.  
+• open_vote — Admin. Open a ballot using top nominees or manual IDs (≤ 3).  
+• close_vote — Admin. Close and remove the active ballot (clears options and movie votes).  
+• vote — Ephemeral: opens the current movie ballot (if one exists).  
+• unvote — Clear your movie vote.  
+• clear_votes — Admin. Clear everyone’s movie votes.
 
-Notes: Admin actions are **guild-only** (cannot be run in DMs).
+Availability (/availability …)
+• wizard — Three steps: Confirm Days → Set Time (modal) → Add Blocks or Presets → Review & Save (Replace or Append).  
+• list — Show your availability (or another user’s if admin).  
+• export — Export your availability as a compact, readable string.  
+• set — Replace availability via DSL string.  
+• append — Append via DSL; overlaps merged, duplicates removed.  
+• add_block — Add one day/time block (HH:MM minute = 00/15/30/45).  
+• add_multi — Add one block across multiple days (e.g., Mon-Thu, Sat).  
+• remove_block — Remove an exact (day, start, end) block.  
+• clear — Clear all availability or just one day.  
+• view — Render a “swimlanes” availability chart (optionally for a single day).
 
-### Movies (`/movies …`)
+Schedule (/schedule …)
+• suggest — Compute overlaps, propose up to 3 time options for voting.  
+• vote — Ephemeral: opens the current time-slot ballot (if one exists).  
+• status — See the current time options with vote counts.  
+• unvote — Clear your time-slot vote.  
+• clear_votes — Admin. Clear everyone’s time votes.  
+• close_vote — Admin. Close and remove the active time-slot vote.  
+• choose — Admin. Finalize a time slot; outputs ISO-8601 start/end times using the leading movie’s runtime and TIMEZONE.
 
-- `nominate` — Nominate a TMDb ID that exists in the catalog.
-- `retract_nomination` — Remove your nomination.
-- `clear_nominations` — Admin. Clear all nominations.
-- `nominees` — Show current top nominees.
-- `open_vote` — Admin. Open a movie vote (top nominees or manual IDs).
-- `clear_ballot` — Admin. Clear the movie ballot.
-- `unvote` — Remove your movie vote.
-- `clear_votes` — Admin. Clear everyone’s movie votes.
-- `request` — Request a movie not in the catalog (modal).
-- `cancel_request` — Cancel your pending request.
-- `requests` — Admin. List requests.
-- `deny_request` — Admin. Deny a request.
-- `delete_request` — Admin. Delete a request.
-- `promote` — Admin. Approve request and add to catalog.
+Seats (/seats …)
+• book — Reserve a guest seat (host not counted).  
+• unbook — Alias for release.  
+• release — Free your seat; first waitlisted user is promoted.  
+• status — See seat assignments and waitlist.  
+• clear — Admin. Clear all seats and waitlist.  
+• swap — Admin. Swap seats between two users.
 
-### Availability (`/availability …`)
+Admin (/admin …)
+• backup — Create a timestamped backup now.  
+• backups — List available backups (newest first).  
+• undo — Restore the most recent backup (autosave restarted).  
+• restore — Restore from a specific backup file name.
 
-- `wizard` — Multi-step wizard: select days → set time → add blocks → review/save.
-- `set` — Replace availability using text DSL.
-- `add` — Alias for `set` (back-compat).
-- `append` — Append using text DSL (deduped/merged).
-- `add_block` — Add a single day/time block.
-- `add_multi` — Add the same block across multiple days.
-- `remove_block` — Remove an exact block.
-- `clear` — Clear all availability or all blocks for a given day.
-- `list` — List your availability (or another user’s if admin).
-- `export` — Export your availability as a compact DSL string.
-- `view` — Render a chart of availability; optionally filter by day.
+----------------------------------------------------------------
 
-**Wizard UX** (important):
-- The wizard is split into **3 steps** to respect Discord’s 5-row UI limit.
-- Times are entered via a **modal** (no row used), which keeps the view within limits.
-- The “Remove Draft Block” dropdown caps at **25 items** to respect Discord’s select limit.
-- Your in-progress wizard “draft” is **deleted** on save/cancel/timeout to avoid memory buildup.
+## Catalog Browser v2 (Ephemeral)
 
-### Schedule (`/schedule …`)
+• Opens via /catalog list or /catalog search.  
+• Clear page label and total count: “Catalog • Page N/M • T total.”  
+• Row 1: Select a movie from the current page slice (up to 25).  
+• Row 2: Actions — “Info” and “Nominate / Retract”.  
+• Row 3: Paging — “Prev”, “Next”, “Close” (Prev/Next disabled at bounds).  
+• The info panel shows poster, runtime, rating, genres, synopsis, and a trailer link.  
+• All edits update both the view and the content, so paging visibly advances.
 
-- `suggest` — Compute overlaps; suggest up to 3 time options for voting.
-- `status` — Show time options with vote counts.
-- `unvote` — Remove your time-slot vote.
-- `clear_votes` — Admin. Clear all time-slot votes.
-- `clear_options` — Admin. Clear all time options (resets votes).
-- `choose` — Admin. Finalize a time option; prints **ISO-8601** start/end based on runtime + timezone.
-
-### Seats (`/seats …`)
-
-- `book` — Reserve a seat (guest). Max is `MAX_SEATS`.
-- `unbook` — Alias for `release`.
-- `release` — Free your seat; promotes first waitlisted user.
-- `status` — Show seat assignments and waitlist.
-- `clear` — Admin. Clear all seats and waitlist.
-- `swap` — Admin. Swap seats between two users.
-
-### Admin (`/admin …`) — guild-only
-
-- `backup` — Create a backup now.
-- `backups` — List available backups.
-- `undo` — Restore the most recent backup. (Autosave is restarted so it writes the restored state.)
-- `restore` — Restore by backup filename.
-
----
+----------------------------------------------------------------
 
 ## Availability Text DSL
 
-You can define your availability quickly without the wizard. Grammar:
+Define availability succinctly with a compact grammar:
 
-- **Days:** full names (`Monday`), or ranges/lists (`Mon-Thu, Sat`). Abbreviations: `Mon, Tue, Wed, Thu, Fri, Sat, Sun`.
-- **Times:** 24-hour `HH:MM`. Minutes must be one of `00`, `15`, `30`, `45`.
-- **Blocks:** `Day HH:MM-HH:MM`, separated by commas.
+Days
+• Mon, Tue, Wed, Thu, Fri, Sat, Sun  
+• Full names also work.  
+• Ranges and lists are allowed: “Mon-Thu, Sat”.
 
-Examples:
+Times
+• 24-hour HH:MM.  
+• Minutes must be 00, 15, 30, or 45.
 
-    Mon 17:00-23:00, Tue-Thu 18:00-22:00, Fri 16:00-23:00
-    Sat 12:00-18:00, Sun 18:00-23:00
-    Mon-Thu 19:00-22:00, Sat 14:00-18:00
+Blocks
+• Day HH:MM-HH:MM  
+• Separate blocks with commas.
 
-The bot validates times, ensures start < end, merges overlaps, and deduplicates.
+Examples
+• Mon 17:00-23:00, Tue-Thu 18:00-22:00, Fri 16:00-23:00  
+• Sat 12:00-18:00, Sun 18:00-23:00  
+• Mon-Thu 19:00-22:00, Sat 14:00-18:00
 
----
+Validation ensures start < end, quarter-minute alignment, merging overlaps, deduping.
 
-## Movie Metadata (TMDb)
-
-- We use **TMDb** for movie search/details, **content certification**, and **granular content descriptors** (when available).
-- Provide **API Key (v3)** via `TMDB_API_KEY`.
-- The bot favors US certification first, then sensible regional fallbacks (implementation details in `tmdb_api.py`).
-- Posters, trailers, runtime, genres, and synopsis are included in embeds.
-
----
+----------------------------------------------------------------
 
 ## Voting & Consensus Rules
 
-- At any time, **movie** and **time-slot** ballots are limited to **≤ 3 options** to force consensus quickly.
-- Casting a vote is done via a dropdown UI. You can unvote with `/movies unvote` or `/schedule unvote`.
-- When an admin runs `/schedule choose`, the bot computes ISO-8601 start/end based on the finalized slot + leading movie runtime + timezone.
+• Movie and time-slot ballots are limited to ≤ 3 options to speed consensus.  
+• You can always bring up the current ballots ephemerally with /movies vote and /schedule vote.  
+• Admin actions (open_vote, suggest) manage a **single active ballot message** per channel; new openings edit/replace the existing message to avoid stale UIs.  
+• Time-slot select values use stable keys, e.g., slot:Monday|18:00|22:00, so votes remain valid across restarts if the same options persist.
 
----
-
-## Backups, Restore, Autosave
-
-- The bot autosaves JSON state on an interval (see `storage.autosave_loop`).
-- You can create manual backups with `/admin backup` (rotation keeps the latest N).
-- `/admin undo` restores the newest backup; `/admin restore` restores by filename.
-- **Important:** After restore/undo, the bot **restarts** the autosave task to bind it to the new state object. This prevents the common “old autosave kept writing the pre-restore object” bug.
-
----
+----------------------------------------------------------------
 
 ## Rendering Availability Charts
 
-- `/availability view` generates a “swimlanes”/waterfall chart showing overlaps and gaps across all users.  
-- You can pass a `day` filter to focus on a single day (e.g., `Monday`).
-- Charts are attached as images (ephemeral).
+• /availability view generates a schematic “swimlanes” chart showing overlaps across users.  
+• Pass a day to focus the chart (e.g., “Monday”); otherwise all days are included.  
+• Charts are attached as images (ephemeral).
 
----
+----------------------------------------------------------------
+
+## TMDb Integration
+
+• All metadata comes from TMDb: title, year, runtime, genres, synopsis, poster, trailer (if available), certification and descriptors.  
+• Provide your TMDb **API Key (v3)** via TMDB_API_KEY.  
+• We favor US certifications first, with sensible regional fallbacks.  
+• This product uses the TMDb API but is not endorsed or certified by TMDb.
+
+----------------------------------------------------------------
 
 ## Permissions & Intents
 
-- This bot uses **default intents**; **no privileged intents** are required.
-- If you see “PrivilegedIntentsRequired”, verify you’re not enabling privileged intents in code, or turn them on in the Developer Portal (not necessary for this bot).
+• Uses default intents; no privileged intents required.  
+• If you see “PrivilegedIntentsRequired”, verify you didn’t enable privileged intents in code, or toggle them on in the Developer Portal (not necessary for this bot).
 
----
+----------------------------------------------------------------
 
 ## Troubleshooting
 
-- **Slash commands not appearing**
-  - If `DEV_GUILD_ID` is set, commands register instantly in that guild. If not, global sync can take several minutes. Check logs: you should see “synced”.
-  - Make sure you’re running from repo root with `python3 -m discord_movie_bot.bot`.
+Slash commands not appearing
+• If DEV_GUILD_ID is set, commands register instantly in that guild. Without it, global sync can take minutes. Check logs for “synced”.  
+• Ensure you run from the repo root: python3 -m discord_movie_bot.bot
 
-- **“Attempted relative import with no known parent package”**
-  - Run the module from the project root: `python3 -m discord_movie_bot.bot`.
+“Attempted relative import with no known parent package”
+• Run from the repo root (module form). Do not execute bot.py directly.
 
-- **Wizard errors / “no open space for item”**
-  - Fixed by the multi-step wizard and modals. Each step respects Discord’s 5-row limit.
-  - The “Remove Draft Block” select is capped at 25 options (Discord limit).
+Wizard issues, component timeouts
+• The wizard is split into 3 steps to respect Discord’s 5-row limit, uses a time modal, and caps removal selects at 25 options.  
+• If a view expires, re-run /availability wizard.
 
-- **TMDb requests failing**
-  - Confirm your `TMDB_API_KEY` is correct (v3 key).
-  - Network or quota issues can cause transient failures; try again.
+TMDb request failures
+• Double-check TMDB_API_KEY is the v3 key and not the Read Access Token.  
+• Network or quota hiccups can cause transient errors; try again.
 
-- **Backups/Restore confusion**
-  - After an `/admin restore` or `/admin undo`, the bot now restarts autosave automatically and uses the restored state going forward.
+Backups/Restore
+• After /admin restore or /admin undo, autosave is restarted automatically and bound to the restored state.
 
-- **Seats/waitlist names**
-  - If a user is on the waitlist but hasn’t interacted with the bot, their name may show as their current Discord display name if the guild can resolve it; otherwise, the numeric user ID is shown.
-
----
+----------------------------------------------------------------
 
 ## Security Posture
 
-- Admin/destructive commands are **guild-only** and permission-gated.
-- We never echo secrets. Configuration is via `.env` only (no shell env required).
-- JSON reads/writes are confined to the `data/` directory (no path traversal).
+• Admin/destructive commands are guild-only and permission-gated.  
+• We never echo secrets; config comes from .env only.  
+• JSON reads/writes are confined to the data/ directory.
 
----
+----------------------------------------------------------------
 
 ## Roadmap Ideas
 
-- Cache TMDb responses (LRU) to reduce latency and API usage.
-- Track and **edit** existing vote messages instead of posting new ones; or auto-delete stale vote messages.
-- Add `/movies status` to summarize current ballot tallies.
-- Archive event outcomes (which movie/time ended up chosen).
-- Optional web UI for availability entry and catalog browsing.
+• Cache TMDb responses (LRU) to lower latency.  
+• Edit or auto-cleanup obsolete vote messages.  
+• /movies status to summarize ballot tallies.  
+• Archive outcomes (which movie/time was chosen).  
+• Optional web UI for availability entry and catalog browsing.
 
----
-
-## Development Notes
-
-- Code is structured to be easy to split into cogs later (`catalog`, `movies`, `availability`, `schedule`, `seats`, `admin`).
-- Logging: the bot uses Python `logging`. Adjust level/format in `bot.py` as desired.
-- Python 3.13 is supported by the tested dependency versions; if future library updates lag behind 3.13, consider using Python 3.11–3.12.
-
----
+----------------------------------------------------------------
 
 ## License
 
-This project aims to be friendly for personal movie nights. Check TMDb’s attribution requirements if you publish screenshots or expose metadata publicly.
+This project is intended for personal movie nights. Review TMDb attribution requirements if you publish screenshots or expose metadata publicly.
 
----
+Acknowledgements
+• Movie data by TMDb. This product uses the TMDb API but is not endorsed or certified by TMDb.  
+• Built with discord.py.
 
-## Acknowledgements
-
-- Movie data provided by **TMDb**. This product uses the TMDb API but is not endorsed or certified by TMDb.
-- Discord bot framework: **discord.py**.
-
----
+----------------------------------------------------------------

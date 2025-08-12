@@ -1,89 +1,192 @@
-"""Persistence for the bot's unified State (atomic JSON, autosave, lock) + backups."""
-
 from __future__ import annotations
+
 import asyncio
 import json
-from datetime import datetime
-from pathlib import Path
-from typing import List, Tuple
+import os
+import time
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List
 
-from .models import State
-from .config import STATE_FILE, AUTOSAVE_INTERVAL, BACKUPS_DIR, MAX_BACKUPS
+from .models import (
+    DayTimeRange, MessageRef, Movie, MovieAdvisory, MovieRequest, ScheduleSlot,
+    State, TicketHolder, state_to_dict,
+)
+from .scheduling import _slot_key
 
-# Single shared lock for writes
-_state_lock = asyncio.Lock()
+DATA_DIR = os.path.join(os.getcwd(), "data")
+STATE_PATH = os.path.join(DATA_DIR, "state.json")
+BACKUPS_DIR = os.path.join(DATA_DIR, "backups")
+
+MAX_BACKUPS = 12
+AUTOSAVE_SEC = 30
+
+_lock = asyncio.Lock()
+
+
+def _ensure_dirs():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(BACKUPS_DIR, exist_ok=True)
+
+
+def _obj_hook(d: Dict[str, Any]) -> Dict[str, Any]:
+    """No special hook needed; handled in load_state migration."""
+    return d
+
 
 async def load_state() -> State:
-    """Load state from STATE_FILE; return empty State if missing/corrupt."""
+    _ensure_dirs()
+    if not os.path.exists(STATE_PATH):
+        return State()
     try:
-        if not STATE_FILE.exists():
-            return State()
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return State.from_dict(data)
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f, object_hook=_obj_hook)
     except Exception:
         return State()
 
+    # ---- migration & validation ----
+    def as_movie(m: Dict[str, Any]) -> Movie:
+        adv = m.get("advisory")
+        advisory = MovieAdvisory(**adv) if isinstance(adv, dict) else None
+        return Movie(
+            tmdb_id=int(m["tmdb_id"]),
+            title=m.get("title", ""),
+            year=str(m.get("year", "")),
+            runtime=int(m.get("runtime", 0) or 0),
+            overview=m.get("overview", ""),
+            genres=list(m.get("genres", []) or []),
+            poster_url=m.get("poster_url"),
+            trailer_url=m.get("trailer_url"),
+            advisory=advisory,
+        )
+
+    def as_range(r: Dict[str, Any]) -> DayTimeRange:
+        return DayTimeRange(day=r["day"], start_time=r["start_time"], end_time=r["end_time"])
+
+    def as_slot(s: Dict[str, Any]) -> ScheduleSlot:
+        day = s["day"]; st = s["start_time"]; et = s["end_time"]
+        key = s.get("key") or _slot_key(day, st, et)
+        parts = list(s.get("participants", []) or [])
+        return ScheduleSlot(day=day, start_time=st, end_time=et, participants=parts, key=key)
+
+    def as_holder(h: Dict[str, Any]) -> TicketHolder:
+        av = [as_range(r) for r in (h.get("availability") or [])]
+        tv = h.get("time_vote")
+        # migrate time_vote int -> None (stale), we now use string keys
+        if isinstance(tv, int):
+            tv = None
+        return TicketHolder(
+            user_id=int(h["user_id"]),
+            user_name=h.get("user_name", str(h["user_id"])),
+            seat=h.get("seat"),
+            movie_vote=h.get("movie_vote"),
+            time_vote=tv,
+            availability=av
+        )
+
+    def as_request(r: Dict[str, Any]) -> MovieRequest:
+        return MovieRequest(
+            request_id=int(r["request_id"]),
+            user_id=int(r["user_id"]),
+            user_name=r.get("user_name", str(r["user_id"])),
+            query=r.get("query", ""),
+            note=r.get("note"),
+            status=r.get("status", "pending"),
+            resolved_tmdb_id=r.get("resolved_tmdb_id"),
+        )
+
+    movies = {int(k): as_movie(v) for k, v in (raw.get("movies") or {}).items()}
+    nominations = {int(k): list(v or []) for k, v in (raw.get("nominations") or {}).items()}
+    holders = {int(k): as_holder(v) for k, v in (raw.get("ticket_holders") or {}).items()}
+
+    movie_options = [int(x) for x in (raw.get("movie_options") or [])]
+    time_options = [as_slot(s) for s in (raw.get("time_options") or [])]
+
+    waitlist = [int(x) for x in (raw.get("waitlist") or [])]
+    reqs = {int(k): as_request(v) for k, v in (raw.get("movie_requests") or {}).items()}
+    nreq = int(raw.get("next_request_id", 1) or 1)
+
+    def as_msgref(d: Any):
+        if not isinstance(d, dict):
+            return None
+        try:
+            return MessageRef(channel_id=int(d["channel_id"]), message_id=int(d["message_id"]))
+        except Exception:
+            return None
+
+    return State(
+        movies=movies,
+        nominations=nominations,
+        ticket_holders=holders,
+        movie_options=movie_options,
+        time_options=time_options,
+        waitlist=waitlist,
+        movie_requests=reqs,
+        next_request_id=nreq,
+        active_movie_ballot_message=as_msgref(raw.get("active_movie_ballot_message")),
+        active_time_ballot_message=as_msgref(raw.get("active_time_ballot_message")),
+    )
+
+
 async def save_state(state: State) -> None:
-    """Atomically save the entire state.json under a lock."""
-    payload = state.to_dict()
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
-    tmp = Path(str(STATE_FILE) + ".tmp")
-    async with _state_lock:
-        tmp.write_text(text, encoding="utf-8")
-        tmp.replace(STATE_FILE)
+    _ensure_dirs()
+    data = state_to_dict(state)
+    # atomic write
+    tmp = STATE_PATH + ".tmp"
+    async with _lock:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_PATH)
+
 
 async def autosave_loop(state: State) -> None:
-    """Background task to periodically save the state."""
     while True:
-        await asyncio.sleep(AUTOSAVE_INTERVAL)
         try:
+            await asyncio.sleep(AUTOSAVE_SEC)
             await save_state(state)
-        except Exception as e:
-            print(f"[autosave] Failed to save state: {e}")
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            # swallow; next loop will try again
+            pass
 
-# -------------------- Backups --------------------
-
-def _timestamp() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
-
-def _backup_filename(ts: str) -> Path:
-    return BACKUPS_DIR / f"state-{ts}.json"
-
-def _list_backup_files() -> List[Path]:
-    return sorted(BACKUPS_DIR.glob("state-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 async def backup_state(state: State) -> str:
-    """Write a timestamped backup of the current state. Returns backup file name (basename)."""
-    ts = _timestamp()
-    path = _backup_filename(ts)
-    payload = state.to_dict()
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
-    async with _state_lock:
-        path.write_text(text, encoding="utf-8")
-    # prune old backups
-    files = _list_backup_files()
-    for old in files[MAX_BACKUPS:]:
+    _ensure_dirs()
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    name = f"state-{ts}.json"
+    path = os.path.join(BACKUPS_DIR, name)
+    data = state_to_dict(state)
+    async with _lock:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    # rotate
+    names = sorted(os.listdir(BACKUPS_DIR), reverse=True)
+    for old in names[MAX_BACKUPS:]:
         try:
-            old.unlink(missing_ok=True)
+            os.remove(os.path.join(BACKUPS_DIR, old))
         except Exception:
             pass
-    return path.name
+    return name
+
 
 async def list_backups() -> List[str]:
-    """Return backup basenames in newest-first order."""
-    return [p.name for p in _list_backup_files()]
+    _ensure_dirs()
+    try:
+        names = sorted(os.listdir(BACKUPS_DIR), reverse=True)
+        return names
+    except Exception:
+        return []
 
-async def restore_state_from_backup(backup_name: str) -> State:
-    """Restore STATE_FILE from a backup file (by basename). Returns loaded State."""
-    candidate = BACKUPS_DIR / backup_name
-    if not candidate.exists():
-        raise FileNotFoundError("Backup not found.")
-    text = candidate.read_text(encoding="utf-8")
-    data = json.loads(text)
-    new_state = State.from_dict(data)
-    # write atomically
-    tmp = Path(str(STATE_FILE) + ".tmp")
-    async with _state_lock:
-        tmp.write_text(json.dumps(new_state.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(STATE_FILE)
-    return new_state
+
+async def restore_state_from_backup(name: str) -> State:
+    _ensure_dirs()
+    path = os.path.join(BACKUPS_DIR, name)
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    # Reuse load_state migration by writing temp and reading via load_state()
+    tmp = STATE_PATH + ".restore_tmp"
+    with open(tmp, "w", encoding="utf-8") as wf:
+        json.dump(raw, wf, ensure_ascii=False, indent=2)
+    # Atomic replace to trigger the exact same reader
+    os.replace(tmp, STATE_PATH)
+    return await load_state()
